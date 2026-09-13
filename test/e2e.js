@@ -1,6 +1,8 @@
 'use strict';
 // 端到端冒烟测试：两名玩家建房→加入→开局→接词→质疑→裁定→断线重连→结算→回放
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const URL = 'ws://localhost:8080';
 let failures = 0;
@@ -185,6 +187,48 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   await S2.waitFor(c => c.msgs.some(m => m.type === 'replay'));
   check('观战者结束后可看回放', S2.msgs.some(m => m.type === 'replay' && m.frames.length === frames.length));
 
+  // 对局结束后观战者刷新页面：旧观战会话不应再自动恢复
+  const tokenS2 = S2.token;
+  S2.ws.close();
+  await sleep(300);
+  const S2b = client('朋友');
+  await S2b.opened;
+  S2b.send({ type: 'reconnect', token: tokenS2 });
+  await S2b.waitFor(c => c.msgs.some(m => m.type === 'error'));
+  check('结束后观战者凭旧 token 刷新被拒',
+    S2b.msgs.some(m => m.type === 'error' && /观战会话已失效/.test(m.message)));
+  S2b.ws.close();
+  await sleep(300);
+
+  // 玩家结束后仍可凭 token 重连回来看结算/回放
+  const tokenAEnd = A1.token;
+  A1.ws.close();
+  await sleep(300);
+  const A2 = client('甲');
+  await A2.opened;
+  A2.send({ type: 'reconnect', token: tokenAEnd });
+  await A2.waitFor(c => c.state && c.state.phase === 'ended');
+  check('玩家结束后仍可凭 token 重连', A2.state.you === A1.state.you && !!A2.state.scores);
+
+  // 观战者重新输入房间码即可观看结算与回放
+  const S2c = client('朋友');
+  await S2c.opened;
+  S2c.send({ type: 'spectate', name: '回来看结算', roomCode: code });
+  await S2c.waitFor(c => c.state && c.state.spectating === true && c.state.phase === 'ended');
+  check('重新输入房间码可观战已结束房间', S2c.state.spectators.some(s => s.name === '回来看结算'));
+  S2c.send({ type: 'replay' });
+  await S2c.waitFor(c => c.msgs.some(m => m.type === 'replay'));
+  check('重新观战后仍可看回放', S2c.msgs.some(m => m.type === 'replay' && m.frames.length === frames.length));
+  S2c.ws.close();
+
+  // 落盘：结束的房间不带观战者与观战 token，旧观战记录不残留
+  await sleep(500); // 等 300ms 防抖落盘
+  const data = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'rooms.json'), 'utf8'));
+  const ended = data.rooms.find(r => r.code === code);
+  check('结束房间落盘不含观战者', Array.isArray(ended.spectators) && ended.spectators.length === 0);
+  check('结束房间落盘不含观战 token',
+    !Object.values(data.tokens).some(t => t.spectator && t.roomCode === code));
+
   // 大厅观战：新房只在大厅阶段也能进入
   const C = client('新房主');
   await C.opened;
@@ -195,11 +239,20 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   S3.send({ type: 'spectate', name: '大厅观赛', roomCode: C.state.code });
   await S3.waitFor(c => c.state && c.state.spectating === true);
   check('大厅阶段可观战（看规则与玩家）', S3.state.phase === 'lobby');
+  // 未结束房间的观战者刷新仍可凭 token 恢复（防止误伤进行中/大厅的观战会话）
+  const tokenS3 = S3.token;
+  S3.ws.close();
+  await sleep(300);
+  const S3b = client('大厅观赛');
+  await S3b.opened;
+  S3b.send({ type: 'reconnect', token: tokenS3 });
+  await S3b.waitFor(c => c.state && c.state.spectating === true);
+  check('大厅观战者刷新后仍可恢复', S3b.state.phase === 'lobby');
   S3.send({ type: 'startGame' });
   await sleep(200);
-  check('大厅观战者不能开始游戏', S3.state.phase === 'lobby');
+  check('大厅观战者不能开始游戏', S3b.state.phase === 'lobby');
 
-  A1.ws.close(); B2.ws.close(); S2.ws.close(); C.ws.close(); S3.ws.close();
+  A2.ws.close(); B2.ws.close(); C.ws.close(); S3b.ws.close();
   console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 })().catch(e => { console.error('冒烟测试异常:', e.message); process.exit(1); });

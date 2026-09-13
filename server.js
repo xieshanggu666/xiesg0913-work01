@@ -62,11 +62,20 @@ function saveRooms() {
   saveTimer = setTimeout(() => {
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
-      const data = {
-        rooms: [...rooms.values()],
-        tokens: Object.fromEntries(tokens),
-      };
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data));
+      // 结束的房间只保留回放/结算所需的玩家与日志，不持久化观战者；
+      // 观战是临时身份，重启后本就不可恢复，避免旧观战记录残留在线名单。
+      const persistedRooms = [...rooms.values()].map(r =>
+        r.phase === 'ended' ? { ...r, spectators: [] } : r);
+      const liveCodes = new Set(persistedRooms.map(r => r.code));
+      const persistedTokens = {};
+      for (const [tok, ref] of tokens) {
+        if (!liveCodes.has(ref.roomCode)) continue;
+        if (ref.spectator && rooms.get(ref.roomCode).phase === 'ended') continue;
+        persistedTokens[tok] = ref;
+      }
+      fs.writeFileSync(DATA_FILE, JSON.stringify({
+        rooms: persistedRooms, tokens: persistedTokens,
+      }));
     } catch (e) { console.error('保存失败', e); }
   }, 300);
 }
@@ -233,6 +242,17 @@ const handlers = {
     if (ref.spectator) {
       const s = (room.spectators || []).find(x => x.id === ref.playerId);
       if (!s) return sendErr(ws, '观战会话已失效，请重新观战');
+      // 观战是临时只读会话：对局结束后不再凭 token 恢复。刷新页面应回到首页，
+      // 想看结算/回放可重新输入房间码进入。移除记录并作废 token，避免旧会话残留。
+      if (room.phase === 'ended') {
+        cancelSpectatorPrune(s.id);
+        game.removeSpectator(room, s.id);
+        for (const [tok, r] of tokens) {
+          if (r.spectator && r.playerId === s.id) tokens.delete(tok);
+        }
+        broadcast(room);
+        return sendErr(ws, '对局已结束，观战会话已失效，请重新输入房间码观战');
+      }
       s.connected = true;
       cancelSpectatorPrune(s.id);
       ctx.playerId = s.id; ctx.roomCode = room.code;
