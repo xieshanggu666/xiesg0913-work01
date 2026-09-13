@@ -21,7 +21,7 @@ const tokens = new Map();
 const sockets = new Map();
 /** 观战者断线宽限期：id -> setTimeout，超过后从房间清出（覆盖刷新页面的短暂离线） */
 const spectatorPruneTimers = new Map();
-const SPECTATOR_TTL_MS = 60 * 1000;
+const SPECTATOR_TTL_MS = Number(process.env.SPECTATOR_TTL_MS) || 60 * 1000;
 
 function loadRooms() {
   try {
@@ -29,7 +29,12 @@ function loadRooms() {
     for (const room of raw.rooms) {
       // 旧存档没有 spectators 字段时补空
       if (!Array.isArray(room.spectators)) room.spectators = [];
+      // 重启后不存在任何活动连接，持久化的在线标记全部失真：
+      // 玩家/观战者先置离线（凭 token 重连即恢复）；不回来的观战者走宽限清理，
+      // 避免他们仍被计入在线人数、让新观战者撞上"观战人数已满"或残留在大厅名单。
+      game.resetConnectionsAfterRestart(room);
       rooms.set(room.code, room);
+      for (const s of room.spectators) scheduleSpectatorPrune(s.id);
       // 重启后回合计时重新挂上
       if (room.phase === 'playing' && room.turn) {
         if (room.turn.deadline) {
@@ -134,7 +139,7 @@ function scheduleSpectatorPrune(spectatorId) {
       const s = (room.spectators || []).find(x => x.id === spectatorId);
       if (!s || sockets.has(spectatorId)) continue;
       game.removeSpectator(room, spectatorId);
-      saveRooms();
+      broadcast(room); // 让其他人名单中的旧观战者消失
     }
     // 清掉失效的观战 token，避免 token 表无限增长
     for (const [tok, ref] of tokens) {

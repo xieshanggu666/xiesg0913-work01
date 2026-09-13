@@ -98,6 +98,14 @@ function removeSpectator(room, id) {
   if (room.spectators.length !== before) logEvent(room, 'leave', { spectatorId: id });
 }
 
+// 服务器重启后内存中的 WebSocket 全部消失，持久化的 connected 标记已失真：
+// 玩家与观战者一律先标记离线。玩家/观战者凭 token 重连时恢复在线；
+// 观战者另由服务器安排宽限清理，避免旧观战者占名额、残留在大厅名单里。
+function resetConnectionsAfterRestart(room) {
+  room.players.forEach(p => { p.connected = false; });
+  (room.spectators || []).forEach(s => { s.connected = false; });
+}
+
 // 所有行动的统一守门：观战者一律只读
 function assertPlayer(room, id) {
   if (isSpectator(room, id)) return '观战者不能参与对局';
@@ -443,6 +451,7 @@ function publicView(room, forPlayerId) {
 module.exports = {
   RELATION_TYPES, DEFAULT_RULESET, START_WORD_POOL, MAX_SPECTATORS,
   newRoom, addPlayer, addSpectator, isSpectator, removeSpectator,
+  resetConnectionsAfterRestart,
   setRuleSet, startGame,
   playWord, reinforce, endTurn, challenge, resolveChallenge, ensureAdjudicatorOnline,
   computeScores, buildReplay, publicView, cascadeRemove,

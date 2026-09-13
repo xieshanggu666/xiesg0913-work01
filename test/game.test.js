@@ -263,3 +263,32 @@ test('断线的观战者可恢复身份，被清出房间后需重新进入', ()
   assert.ok(!g.isSpectator(room, 'sp1'));
   assert.strictEqual(room.players.length, 2, '清出观战者不影响玩家');
 });
+
+test('服务器重启后旧观战者不占在线名额、不阻止新观战者', () => {
+  const room = makeRoom(['甲', '乙']);
+  // 占满观战名额（重启前都在线）
+  for (let i = 0; i < g.MAX_SPECTATORS; i++) {
+    assert.strictEqual(g.addSpectator(room, `sp${i}`, `观${i}`), null);
+  }
+  assert.strictEqual(room.spectators.filter(s => s.connected).length, g.MAX_SPECTATORS);
+  assert.match(g.addSpectator(room, 'spX', '再来一个'), /已满/);
+
+  // 模拟重启：持久化房间重新加载，连接已全部不存在
+  g.resetConnectionsAfterRestart(room);
+  assert.ok(room.spectators.every(s => s.connected === false), '旧观战者应全部离线');
+  assert.ok(room.players.every(p => p.connected === false), '玩家也应离线（待重连恢复）');
+
+  // 在线名额立即释放：新观战者不必等旧记录被清出就能进入
+  assert.strictEqual(g.addSpectator(room, 'spNew', '新观众'), null);
+  assert.strictEqual(room.spectators.filter(s => s.connected).length, 1);
+
+  // 旧观战者宽限期内凭 token 重连仍可恢复
+  room.spectators.find(s => s.id === 'sp0').connected = true;
+  assert.ok(g.isSpectator(room, 'sp0'));
+
+  // 宽限期结束后服务器清掉不回来的旧观战者，名单只留新的/回来的
+  for (const id of room.spectators.filter(s => !s.connected).map(s => s.id)) {
+    g.removeSpectator(room, id);
+  }
+  assert.deepStrictEqual(room.spectators.map(s => s.id).sort(), ['sp0', 'spNew']);
+});
