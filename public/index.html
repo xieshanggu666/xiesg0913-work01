@@ -19,6 +19,7 @@
         <button id="btn-create" class="primary">创建房间</button>
         <input id="inp-code" maxlength="4" placeholder="房间码">
         <button id="btn-join">加入</button>
+        <button id="btn-spectate">观战</button>
       </div>
     </div>
     <p id="home-error" class="error"></p>
@@ -31,6 +32,7 @@
     <div class="card">
       <h3>玩家（<span id="lobby-count"></span>/6）</h3>
       <ul id="lobby-players" class="players"></ul>
+      <ul id="lobby-spectators" class="players spectators"></ul>
     </div>
     <div class="card" id="rules-card">
       <h3>本局规则 <button id="btn-edit-rules" class="link hidden">修改</button></h3>
@@ -61,6 +63,7 @@
     </div>
     <button id="btn-start" class="primary big hidden">开始游戏</button>
     <p class="hint" id="lobby-wait">等待房主开始…</p>
+    <div class="row"><button id="btn-exit-spectate" class="hidden">退出观战</button></div>
   </section>
 
   <!-- 对局 -->
@@ -74,6 +77,10 @@
       </div>
     </header>
     <div id="scoreboard"></div>
+    <div id="spectator-banner" class="hidden">
+      <span>👁 观战模式：你正在只读观看，不能接词、加固、质疑或更改规则。</span>
+      <button id="btn-exit-spectate2" class="link">退出观战</button>
+    </div>
     <div id="challenge-banner" class="hidden">
       <span id="challenge-banner-text"></span>
       <button id="btn-goto-judge" class="primary hidden">去裁定</button>
@@ -81,7 +88,7 @@
     <div id="board" class="board"></div>
     <footer id="action-bar">
       <div id="ap-info"></div>
-      <div class="row">
+      <div class="row" id="action-row">
         <button id="btn-play" class="primary">接词</button>
         <button id="btn-reinforce">加固</button>
         <button id="btn-endturn">结束回合</button>
@@ -96,6 +103,7 @@
     <div class="row">
       <button id="btn-replay2" class="primary">回放本局</button>
       <button id="btn-home">回到首页</button>
+      <button id="btn-exit-spectate3" class="hidden">退出观战</button>
     </div>
   </section>
 </div>

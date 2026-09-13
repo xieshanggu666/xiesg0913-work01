@@ -14,16 +14,21 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // ---------- 房间存储 ----------
 
-/** rooms: Map<code, room>; tokens: Map<token, {roomCode, playerId}> */
+/** rooms: Map<code, room>; tokens: Map<token, {roomCode, playerId, spectator?}> */
 const rooms = new Map();
 const tokens = new Map();
-/** sockets: Map<playerId, Set<ws>> */
+/** sockets: Map<playerId, Set<ws>>（玩家与观战者共用，id 不冲突：观战者带 sp_ 前缀） */
 const sockets = new Map();
+/** 观战者断线宽限期：id -> setTimeout，超过后从房间清出（覆盖刷新页面的短暂离线） */
+const spectatorPruneTimers = new Map();
+const SPECTATOR_TTL_MS = 60 * 1000;
 
 function loadRooms() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     for (const room of raw.rooms) {
+      // 旧存档没有 spectators 字段时补空
+      if (!Array.isArray(room.spectators)) room.spectators = [];
       rooms.set(room.code, room);
       // 重启后回合计时重新挂上
       if (room.phase === 'playing' && room.turn) {
@@ -58,10 +63,14 @@ function saveRooms() {
 // ---------- 广播 ----------
 
 function broadcast(room) {
-  for (const p of room.players) {
-    const set = sockets.get(p.id);
+  const recipients = [
+    ...room.players.map(p => p.id),
+    ...(room.spectators || []).map(s => s.id),
+  ];
+  for (const id of recipients) {
+    const set = sockets.get(id);
     if (!set) continue;
-    const view = JSON.stringify({ type: 'state', state: game.publicView(room, p.id) });
+    const view = JSON.stringify({ type: 'state', state: game.publicView(room, id) });
     for (const ws of set) if (ws.readyState === 1) ws.send(view);
   }
   saveRooms();
@@ -99,9 +108,9 @@ function makeRoomCode() {
   return code;
 }
 
-function issueToken(roomCode, playerId) {
+function issueToken(roomCode, playerId, spectator = false) {
   const token = crypto.randomBytes(16).toString('hex');
-  tokens.set(token, { roomCode, playerId });
+  tokens.set(token, { roomCode, playerId, spectator });
   return token;
 }
 
@@ -110,14 +119,47 @@ function attachSocket(playerId, ws) {
   sockets.get(playerId).add(ws);
 }
 
+function cancelSpectatorPrune(spectatorId) {
+  const t = spectatorPruneTimers.get(spectatorId);
+  if (t) { clearTimeout(t); spectatorPruneTimers.delete(spectatorId); }
+}
+
+// 观战者最后一个连接断开：标记离线并给一个宽限期，超时再清出房间
+// （页面刷新/短暂断网时 token 仍可恢复观战身份）
+function scheduleSpectatorPrune(spectatorId) {
+  cancelSpectatorPrune(spectatorId);
+  spectatorPruneTimers.set(spectatorId, setTimeout(() => {
+    spectatorPruneTimers.delete(spectatorId);
+    for (const room of rooms.values()) {
+      const s = (room.spectators || []).find(x => x.id === spectatorId);
+      if (!s || sockets.has(spectatorId)) continue;
+      game.removeSpectator(room, spectatorId);
+      saveRooms();
+    }
+    // 清掉失效的观战 token，避免 token 表无限增长
+    for (const [tok, ref] of tokens) {
+      if (ref.spectator && ref.playerId === spectatorId) tokens.delete(tok);
+    }
+  }, SPECTATOR_TTL_MS));
+}
+
 function detachSocket(playerId, ws) {
   const set = sockets.get(playerId);
   if (!set) return;
   set.delete(ws);
   if (set.size === 0) {
     sockets.delete(playerId);
-    // 标记断线并广播；若待裁定质疑的裁定者掉线，移交裁定权
     for (const room of rooms.values()) {
+      // 观战者：走离线宽限，不触发玩家断线/裁定移交逻辑
+      const sp = (room.spectators || []).find(x => x.id === playerId);
+      if (sp) {
+        if (sp.connected) {
+          sp.connected = false;
+          broadcast(room);
+        }
+        scheduleSpectatorPrune(playerId);
+        continue;
+      }
       const p = room.players.find(x => x.id === playerId);
       if (p && p.connected) {
         p.connected = false;
@@ -156,12 +198,39 @@ const handlers = {
     broadcast(room);
   },
 
-  // 断线重连：凭 token 恢复身份
+  // 观战：凭房间码获得只读身份，任何阶段都可进入（大厅可看规则/玩家，对局中持续收推送）
+  spectate(ws, ctx, msg) {
+    const room = rooms.get(String(msg.roomCode || '').toUpperCase());
+    if (!room) return sendErr(ws, '房间不存在，请检查房间码');
+    const spectatorId = 'sp_' + crypto.randomBytes(8).toString('hex');
+    const err = game.addSpectator(room, spectatorId, msg.name);
+    if (err) return sendErr(ws, err);
+    const token = issueToken(room.code, spectatorId, true);
+    ctx.playerId = spectatorId; ctx.roomCode = room.code;
+    attachSocket(spectatorId, ws);
+    ws.send(JSON.stringify({ type: 'joined', token, roomCode: room.code,
+      playerId: spectatorId, spectator: true }));
+    broadcast(room);
+  },
+
+  // 断线重连：凭 token 恢复身份（玩家或观战者）
   reconnect(ws, ctx, msg) {
     const ref = tokens.get(msg.token);
     if (!ref) return sendErr(ws, '会话已失效，请重新加入');
     const room = rooms.get(ref.roomCode);
     if (!room) return sendErr(ws, '房间已不存在');
+    if (ref.spectator) {
+      const s = (room.spectators || []).find(x => x.id === ref.playerId);
+      if (!s) return sendErr(ws, '观战会话已失效，请重新观战');
+      s.connected = true;
+      cancelSpectatorPrune(s.id);
+      ctx.playerId = s.id; ctx.roomCode = room.code;
+      attachSocket(s.id, ws);
+      ws.send(JSON.stringify({ type: 'joined', token: msg.token,
+        roomCode: room.code, playerId: s.id, spectator: true }));
+      broadcast(room);
+      return;
+    }
     const p = room.players.find(x => x.id === ref.playerId);
     if (!p) return sendErr(ws, '你不在该房间中');
     p.connected = true;
@@ -249,6 +318,12 @@ function ctxRoom(ctx) {
   return room;
 }
 
+// 纵深防御：game.js 内已按身份拒绝所有写操作，这里在协议层统一拦截，
+// 保证观战 token 即使伪造消息也无法接词、加固、质疑、改规则或开始游戏。
+const SPECTATOR_FORBIDDEN = new Set([
+  'setRules', 'startGame', 'play', 'reinforce', 'endTurn', 'challenge', 'resolve',
+]);
+
 function sendErr(ws, message, context) {
   if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'error', message, context }));
 }
@@ -278,6 +353,12 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
     const h = handlers[msg.type];
     if (h) {
+      if (SPECTATOR_FORBIDDEN.has(msg.type) && ctx.playerId) {
+        const r0 = rooms.get(ctx.roomCode);
+        if (r0 && game.isSpectator(r0, ctx.playerId)) {
+          return sendErr(ws, '观战者为只读，不能参与对局');
+        }
+      }
       try { h(ws, ctx, msg); }
       catch (e) { console.error(e); sendErr(ws, '服务器开小差了，请重试'); }
     }

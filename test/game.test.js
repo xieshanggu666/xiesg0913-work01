@@ -198,3 +198,68 @@ test('涉及房主的质疑由其他玩家裁定', () => {
   assert.strictEqual(g.resolveChallenge(room, 'p0', 'uphold'), '只有裁定者可以判定');
   assert.strictEqual(g.resolveChallenge(room, room.pendingChallenge.adjudicatorId, 'uphold'), null);
 });
+
+// ---------- 观战模式 ----------
+
+test('观战：对局开始后仍可加入，且不占玩家名额、不进入回合顺序', () => {
+  const room = makeRoom(['甲', '乙']);
+  assert.strictEqual(g.addSpectator(room, 'sp1', '朋友'), null);
+  assert.ok(g.isSpectator(room, 'sp1'));
+  assert.strictEqual(room.players.length, 2);
+  assert.deepStrictEqual(g.computeScores(room).map(s => s.playerId), ['p0', 'p1']);
+});
+
+test('观战：大厅阶段也能进入看规则与玩家', () => {
+  const room = g.newRoom('LOBBY', 'p0', '甲');
+  g.addPlayer(room, 'p0', '甲');
+  assert.strictEqual(g.addSpectator(room, 'sp1', '朋友'), null);
+  const view = g.publicView(room, 'sp1');
+  assert.strictEqual(view.spectating, true);
+  assert.strictEqual(view.players.length, 1);
+  assert.strictEqual(view.spectators.length, 1);
+  // 玩家视角里自己不是观战者，但能看到观战名单
+  assert.strictEqual(g.publicView(room, 'p0').spectating, false);
+  assert.strictEqual(g.publicView(room, 'p0').spectators.length, 1);
+});
+
+test('观战者不能接词、加固、结束回合、质疑或裁定', () => {
+  const room = makeRoom(['甲', '乙']);
+  g.addSpectator(room, 'sp1', '朋友');
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  assert.match(g.playWord(room, 'sp1', { word: '旁观词', parentId: 'start0',
+    relation: 'synonym', reason: '足够长度的解释' }), /观战/);
+  assert.match(g.reinforce(room, 'sp1', node.id), /观战/);
+  assert.match(g.endTurn(room, 'sp1'), /观战/);
+  assert.match(g.challenge(room, 'sp1', node.id), /观战/);
+  // 观战者即便伪造裁定请求也被拒绝
+  g.challenge(room, 'p1', node.id);
+  assert.match(g.resolveChallenge(room, 'sp1', 'uphold'), /观战/);
+});
+
+test('观战者不能修改规则或开始游戏', () => {
+  const lobby = g.newRoom('L', 'p0', '甲');
+  g.addPlayer(lobby, 'p0', '甲');
+  g.addSpectator(lobby, 'sp1', '朋友');
+  assert.match(g.setRuleSet(lobby, 'sp1', { turnSeconds: 60 }), /观战/);
+  assert.match(g.startGame(lobby, 'sp1'), /观战/);
+});
+
+test('观战人数有上限', () => {
+  const room = makeRoom(['甲', '乙']);
+  for (let i = 0; i < g.MAX_SPECTATORS; i++) {
+    assert.strictEqual(g.addSpectator(room, `sp${i}`, `观${i}`), null);
+  }
+  assert.match(g.addSpectator(room, 'spX', '再多一个'), /已满/);
+});
+
+test('断线的观战者可恢复身份，被清出房间后需重新进入', () => {
+  const room = makeRoom(['甲', '乙']);
+  g.addSpectator(room, 'sp1', '朋友');
+  room.spectators[0].connected = false;
+  room.spectators[0].connected = true; // 模拟刷新页面后凭 token 恢复
+  assert.ok(g.isSpectator(room, 'sp1'));
+  g.removeSpectator(room, 'sp1');
+  assert.ok(!g.isSpectator(room, 'sp1'));
+  assert.strictEqual(room.players.length, 2, '清出观战者不影响玩家');
+});

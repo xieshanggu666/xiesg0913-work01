@@ -121,6 +121,47 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   await B2.waitFor(c => c.state && c.state.phase === 'playing');
   check('断线重连恢复局面', B2.state.nodes.length === A1.state.nodes.length);
 
+  // 观战：对局进行中凭房间码进入，持续收到玩家/词链/回合推送
+  const S = client('朋友');
+  await S.opened;
+  S.send({ type: 'spectate', name: '朋友', roomCode: code });
+  await S.waitFor(c => c.state && c.state.spectating === true);
+  check('观战者获得只读身份', S.state.spectating === true);
+  check('观战者看到全部玩家与当前词链',
+    S.state.players.length === 2 && S.state.nodes.length === A1.state.nodes.length);
+  check('观战者看到回合与计时', !!S.state.turn && (!!S.state.turn.deadline || S.state.turn.pausedRemaining != null));
+  await A1.waitFor(c => (c.state.spectators || []).some(s => s.name === '朋友'));
+  check('玩家能看到观战者', true);
+
+  // 观战者尝试所有写操作：一律被服务器拒绝（纵深防御，协议层拦截）
+  const nodeId = S.state.nodes.find(n => n.ownerId).id;
+  for (const [m, extra] of [
+    ['play', { word: '捣乱词', parentId: S.state.nodes[0].id, relation: 'synonym', reason: '观战者不该能接词' }],
+    ['reinforce', { nodeId }],
+    ['endTurn', {}],
+    ['challenge', { nodeId }],
+    ['resolve', { verdict: 'uphold' }],
+    ['setRules', { ruleSet: { turnSeconds: 30 } }],
+    ['startGame', {}],
+  ]) {
+    S.send({ type: m, ...extra });
+  }
+  await sleep(300);
+  const denied = S.msgs.filter(m => m.type === 'error' && /观战|只读/.test(m.message)).length;
+  check('观战者的全部行动被拒绝（7 项）', denied >= 7);
+  check('观战者捣乱未改变局面',
+    S.state.nodes.length === A1.state.nodes.length && !S.state.nodes.some(n => n.word === '捣乱词'));
+
+  // 观战者断线重连：刷新页面后凭 token 恢复观战身份
+  const tokenS = S.token;
+  S.ws.close();
+  await sleep(300);
+  const S2 = client('朋友');
+  await S2.opened;
+  S2.send({ type: 'reconnect', token: tokenS });
+  await S2.waitFor(c => c.state && c.state.spectating === true);
+  check('观战者刷新后凭 token 恢复身份', S2.state.phase === 'playing');
+
   // 快进结束：轮流空过
   let guard = 0;
   while (A1.state.phase === 'playing' && guard < 50) {
@@ -130,16 +171,35 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     await sleep(120);
   }
   await A1.waitFor(c => c.state.phase === 'ended');
+  await S2.waitFor(c => c.state.phase === 'ended');
   check('游戏结束并结算', Array.isArray(A1.state.scores) && A1.state.scores.length === 2);
+  check('观战者不在结算名单中', !S2.state.scores.some(s => s.playerId === S2.state.you));
   console.log('  结算:', A1.state.scores.map(s => `${s.name}:${s.total}`).join(' '));
 
-  // 回放
+  // 回放：玩家与观战者都能进入现有回放
   A1.send({ type: 'replay' });
   await A1.waitFor(c => c.msgs.some(m => m.type === 'replay'));
   const frames = A1.msgs.find(m => m.type === 'replay').frames;
   check('回放帧可用', frames.length > 5 && frames[frames.length - 1].scores);
+  S2.send({ type: 'replay' });
+  await S2.waitFor(c => c.msgs.some(m => m.type === 'replay'));
+  check('观战者结束后可看回放', S2.msgs.some(m => m.type === 'replay' && m.frames.length === frames.length));
 
-  A1.ws.close(); B2.ws.close();
+  // 大厅观战：新房只在大厅阶段也能进入
+  const C = client('新房主');
+  await C.opened;
+  C.send({ type: 'createRoom', name: '新房主' });
+  await C.waitFor(c => c.state && c.state.phase === 'lobby');
+  const S3 = client('大厅观赛');
+  await S3.opened;
+  S3.send({ type: 'spectate', name: '大厅观赛', roomCode: C.state.code });
+  await S3.waitFor(c => c.state && c.state.spectating === true);
+  check('大厅阶段可观战（看规则与玩家）', S3.state.phase === 'lobby');
+  S3.send({ type: 'startGame' });
+  await sleep(200);
+  check('大厅观战者不能开始游戏', S3.state.phase === 'lobby');
+
+  A1.ws.close(); B2.ws.close(); S2.ws.close(); C.ws.close(); S3.ws.close();
   console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 })().catch(e => { console.error('冒烟测试异常:', e.message); process.exit(1); });

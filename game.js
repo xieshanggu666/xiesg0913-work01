@@ -38,6 +38,8 @@ function uid(prefix) {
 
 // ---------- 房间与玩家 ----------
 
+const MAX_SPECTATORS = 20;
+
 function newRoom(code, hostId, hostName) {
   return {
     code,
@@ -45,6 +47,7 @@ function newRoom(code, hostId, hostName) {
     phase: 'lobby', // lobby | playing | ended
     ruleSet: { ...DEFAULT_RULESET },
     players: [],    // {id,name,color,connected,tokensLeft}
+    spectators: [], // {id,name,connected} 只读观战者，不参与对局
     startWords: [],
     nodes: [],      // {id,word,ownerId,parentId,relation,reason,reinforced,turnCreated,survivedAsRoot}
     log: [],        // 回放事件日志
@@ -67,7 +70,42 @@ function addPlayer(room, id, name) {
   return null;
 }
 
+// ---------- 观战 ----------
+
+// 观战者是只读身份：任意阶段（大厅/对局中/结束）都能进入，但不占玩家名额、
+// 不进入回合顺序、不能发起任何行动。id 由服务器生成（带 sp_ 前缀以便辨认）。
+function addSpectator(room, id, name) {
+  if (!Array.isArray(room.spectators)) room.spectators = [];
+  if (room.spectators.filter(s => s.connected).length >= MAX_SPECTATORS) {
+    return '观战人数已满';
+  }
+  room.spectators.push({
+    id, name: String(name || '观战者').slice(0, 12), connected: true,
+  });
+  logEvent(room, 'spectate', { spectatorId: id, name });
+  return null;
+}
+
+function isSpectator(room, id) {
+  return Array.isArray(room.spectators) && room.spectators.some(s => s.id === id);
+}
+
+// 观战者断线超过 ttlMs（默认 60 秒，覆盖页面刷新的短暂离线）后清出房间
+function removeSpectator(room, id) {
+  if (!Array.isArray(room.spectators)) return;
+  const before = room.spectators.length;
+  room.spectators = room.spectators.filter(s => s.id !== id);
+  if (room.spectators.length !== before) logEvent(room, 'leave', { spectatorId: id });
+}
+
+// 所有行动的统一守门：观战者一律只读
+function assertPlayer(room, id) {
+  if (isSpectator(room, id)) return '观战者不能参与对局';
+  return null;
+}
+
 function setRuleSet(room, playerId, patch) {
+  if (isSpectator(room, playerId)) return '观战者不能修改规则';
   if (playerId !== room.hostId) return '只有房主可以修改规则';
   if (room.phase !== 'lobby') return '游戏开始后不能修改规则';
   const r = room.ruleSet;
@@ -91,6 +129,7 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 // ---------- 开局 ----------
 
 function startGame(room, playerId, rng = Math.random) {
+  if (isSpectator(room, playerId)) return '观战者不能开始游戏';
   if (playerId !== room.hostId) return '只有房主可以开始游戏';
   if (room.phase !== 'lobby') return '游戏已开始';
   if (room.players.length < 2) return '至少需要 2 名玩家';
@@ -132,6 +171,7 @@ function isActivePlayer(room, playerId) {
 }
 
 function playWord(room, playerId, { word, parentId, relation, reason }) {
+  if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
   if (room.pendingChallenge) return '有质疑正在裁定，请稍候';
   if (room.turn.apLeft < 1) return '行动点不足';
@@ -157,6 +197,7 @@ function playWord(room, playerId, { word, parentId, relation, reason }) {
 }
 
 function reinforce(room, playerId, nodeId) {
+  if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
   if (room.pendingChallenge) return '有质疑正在裁定，请稍候';
   if (room.turn.apLeft < 1) return '行动点不足';
@@ -172,6 +213,7 @@ function reinforce(room, playerId, nodeId) {
 }
 
 function endTurn(room, playerId, { auto = false } = {}) {
+  if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
   if (room.pendingChallenge) return '有质疑正在裁定';
   logEvent(room, 'endTurn', { playerId, auto });
@@ -203,6 +245,7 @@ function finishGame(room) {
 
 function challenge(room, playerId, nodeId) {
   if (room.phase !== 'playing') return '游戏未在进行中';
+  if (isSpectator(room, playerId)) return '观战者不能发起质疑';
   if (room.pendingChallenge) return '已有质疑正在裁定';
   if (isActivePlayer(room, playerId)) return '自己的回合不能发起质疑';
   const player = room.players.find(p => p.id === playerId);
@@ -236,6 +279,7 @@ function challenge(room, playerId, nodeId) {
 function resolveChallenge(room, playerId, verdict) {
   const ch = room.pendingChallenge;
   if (!ch) return '没有待裁定的质疑';
+  if (isSpectator(room, playerId)) return '观战者不能参与裁定';
   if (ch.adjudicatorId !== playerId) return '只有裁定者可以判定';
   if (verdict !== 'uphold' && verdict !== 'reject') return '无效的裁定';
   const node = room.nodes.find(n => n.id === ch.nodeId);
@@ -380,9 +424,12 @@ function publicView(room, forPlayerId) {
     phase: room.phase,
     hostId: room.hostId,
     you: forPlayerId,
+    spectating: isSpectator(room, forPlayerId),
     ruleSet: room.ruleSet,
     players: room.players.map(p => ({ id: p.id, name: p.name, color: p.color,
       connected: p.connected, tokensLeft: p.tokensLeft })),
+    spectators: (room.spectators || []).map(s => ({ id: s.id, name: s.name,
+      connected: s.connected })),
     startWords: room.startWords,
     nodes: room.nodes,
     turn: room.turn,
@@ -394,8 +441,9 @@ function publicView(room, forPlayerId) {
 }
 
 module.exports = {
-  RELATION_TYPES, DEFAULT_RULESET, START_WORD_POOL,
-  newRoom, addPlayer, setRuleSet, startGame,
+  RELATION_TYPES, DEFAULT_RULESET, START_WORD_POOL, MAX_SPECTATORS,
+  newRoom, addPlayer, addSpectator, isSpectator, removeSpectator,
+  setRuleSet, startGame,
   playWord, reinforce, endTurn, challenge, resolveChallenge, ensureAdjudicatorOnline,
   computeScores, buildReplay, publicView, cascadeRemove,
 };

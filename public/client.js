@@ -71,6 +71,15 @@
   // ---------- 状态变化 → 提示 / 教学 ----------
 
   function onStateChange(prev, cur) {
+    // 观战者只读：不发任何行动引导，只在进入时提示一次
+    if (cur.spectating) {
+      if (!prev || !prev.spectating) {
+        toast(cur.phase === 'playing'
+          ? '正在观战：玩家、词链、回合和质疑状态会实时同步'
+          : cur.phase === 'ended' ? '对局已结束，可以查看结算与回放' : '正在观战大厅，等待房主开始游戏');
+      }
+      return;
+    }
     if (!prev || prev.phase !== cur.phase) {
       if (cur.phase === 'playing') tip('goal', '【目标】用行动点把新词接到场上，连成你的领地。词链越长得分越高；未加固的连接可能被对手质疑拆除。');
     }
@@ -135,6 +144,8 @@
     $(`screen-${name}`).classList.remove('hidden');
   }
 
+  const isSpectating = () => !!(state && state.spectating);
+
   function playerName(s, id) {
     if (!id) return '中立';
     const p = s.players.find(p => p.id === id);
@@ -160,13 +171,18 @@
        ${p.id === state.hostId ? '（房主）' : ''}
        ${p.id === state.you ? '（你）' : ''}
        ${p.connected ? '' : '<span class="offline">离线</span>'}</li>`).join('');
+    const specs = state.spectators || [];
+    $('lobby-spectators').innerHTML = specs.map(s =>
+      `<li class="spectator">👁 ${esc(s.name)}${s.id === state.you ? '（你·观战）' : '（观战）'}
+       ${s.connected ? '' : '<span class="offline">离线</span>'}</li>`).join('');
     $('rules-summary').innerHTML = rulesSummary(state.ruleSet);
     const isHost = state.you === state.hostId;
     $('btn-edit-rules').classList.toggle('hidden', !isHost);
     $('btn-start').classList.toggle('hidden', !isHost);
+    $('btn-exit-spectate').classList.toggle('hidden', !state.spectating);
     $('lobby-wait').textContent = isHost
       ? (state.players.length < 2 ? '至少需要 2 名玩家才能开始' : '人齐了就点开始吧')
-      : '等待房主开始…';
+      : (state.spectating ? '你正在观战，对局开始后会自动收到局面' : '等待房主开始…');
   }
 
   function rulesSummary(r) {
@@ -185,29 +201,37 @@
 
   function renderGame() {
     const t = state.turn;
-    const active = t && t.playerId === state.you;
+    const spectator = !!state.spectating;
+    const active = !spectator && t && t.playerId === state.you;
     $('turn-info').innerHTML = t
       ? `第 ${t.turnNumber} 回合 · 轮到 <b style="color:${playerColor(state, t.playerId)}">${esc(playerName(state, t.playerId))}</b>${active ? '（你）' : ''}`
       : '';
-    $('ap-info').textContent = active
-      ? `你的行动点：${t.apLeft} / ${state.ruleSet.apPerTurn}`
-      : `你的质疑机会：${(state.players.find(p => p.id === state.you) || {}).tokensLeft ?? 0}`;
+    $('ap-info').textContent = spectator
+      ? '观战中 · 只读'
+      : active
+        ? `你的行动点：${t.apLeft} / ${state.ruleSet.apPerTurn}`
+        : `你的质疑机会：${(state.players.find(p => p.id === state.you) || {}).tokensLeft ?? 0}`;
+
+    $('spectator-banner').classList.toggle('hidden', !spectator);
 
     $('scoreboard').innerHTML = state.players.map(p => {
       const words = state.nodes.filter(n => n.ownerId === p.id).length;
       return `<span class="score-chip ${t && t.playerId === p.id ? 'active' : ''}">
         <span class="dot" style="background:${p.color}"></span>${esc(p.name)} · ${words} 词
         ${p.connected ? '' : '<span class="offline">离线</span>'}</span>`;
-    }).join('');
+    }).join('') + ((state.spectators || []).length
+      ? `<span class="score-chip spec">👁 ${state.spectators.length} 人观战</span>` : '');
 
-    // 待裁定横幅：常显入口，防止弹窗被关掉后整局卡住
+    // 待裁定横幅：常显入口，防止弹窗被关掉后整局卡住（观战者不显示裁定入口）
     const ch = state.pendingChallenge;
     if (ch) {
-      const iAmJudge = ch.adjudicatorId === state.you;
+      const iAmJudge = !spectator && ch.adjudicatorId === state.you;
       const node = state.nodes.find(n => n.id === ch.nodeId);
       $('challenge-banner-text').textContent = iAmJudge
         ? `有质疑等待你裁定${node ? `（目标：${node.word}）` : ''}，裁定前对局暂停`
-        : `等待 ${playerName(state, ch.adjudicatorId)} 裁定质疑…`;
+        : spectator
+          ? `${playerName(state, ch.challengerId)} 发起了质疑，等待 ${playerName(state, ch.adjudicatorId)} 裁定…`
+          : `等待 ${playerName(state, ch.adjudicatorId)} 裁定质疑…`;
       $('btn-goto-judge').classList.toggle('hidden', !iAmJudge);
       $('challenge-banner').classList.remove('hidden');
       // 裁定者每次状态刷新都确保弹窗开着
@@ -218,9 +242,11 @@
 
     renderBoard($('board'), state.nodes, {
       selectable: active,
-      showChallenge: !active && state.phase === 'playing',
+      showChallenge: !active && !spectator && state.phase === 'playing',
     });
 
+    // 观战者：隐藏全部行动按钮，词链不可选
+    $('action-row').classList.toggle('hidden', spectator);
     $('btn-play').disabled = !active || !selectedParent || (t && t.apLeft < 1) || !!state.pendingChallenge;
     $('btn-reinforce').disabled = !active || (t && t.apLeft < 1) || !!state.pendingChallenge;
     $('btn-reinforce').textContent = reinforceMode ? '取消加固' : '加固';
@@ -283,6 +309,7 @@
   }
 
   function onNodeClick(nodeId) {
+    if (isSpectating()) return;
     const t = state.turn;
     if (!t || t.playerId !== state.you) return;
     const node = state.nodes.find(n => n.id === nodeId);
@@ -325,8 +352,11 @@
   function renderEnd() {
     const scores = state.scores || [];
     const meWin = state.winner === state.you;
-    $('end-title').textContent = state.winner
-      ? `🏆 ${playerName(state, state.winner)} 获胜！${meWin ? '（是你）' : ''}` : '平局！';
+    $('btn-exit-spectate3').classList.toggle('hidden', !state.spectating);
+    $('end-title').textContent = state.spectating
+      ? '对局结束（观战中）'
+      : state.winner
+        ? `🏆 ${playerName(state, state.winner)} 获胜！${meWin ? '（是你）' : ''}` : '平局！';
     $('end-scores').innerHTML = `<table>
       <tr><th>玩家</th><th>词数</th><th>最长链</th><th>总分</th></tr>
       ${scores.map(s => `<tr>
@@ -442,6 +472,17 @@
     store.name = name;
     send({ type: 'joinRoom', name, roomCode: code });
   };
+  $('btn-spectate').onclick = () => {
+    const code = $('inp-code').value.trim().toUpperCase();
+    if (code.length !== 4) return ($('home-error').textContent = '请输入 4 位房间码');
+    // 观战身份是临时的、只读的；昵称可选，不写入本地
+    send({ type: 'spectate', name: $('inp-name').value.trim() || '观战者', roomCode: code });
+  };
+  // 退出观战：丢弃临时观战 token，回到首页（不影响房间内对局）
+  const exitSpectate = () => { store.token = null; location.reload(); };
+  $('btn-exit-spectate').onclick = exitSpectate;
+  $('btn-exit-spectate2').onclick = exitSpectate;
+  $('btn-exit-spectate3').onclick = exitSpectate;
 
   // ---------- 规则编辑器 ----------
   // 打开时完整回填当前规则；保存前就地校验；等服务器确认（rulesSaved）后再关闭，
