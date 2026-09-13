@@ -26,15 +26,17 @@ const SPECTATOR_TTL_MS = Number(process.env.SPECTATOR_TTL_MS) || 60 * 1000;
 function loadRooms() {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const loadedRoomCodes = new Set();
     for (const room of raw.rooms) {
       // 旧存档没有 spectators 字段时补空
       if (!Array.isArray(room.spectators)) room.spectators = [];
-      // 重启后不存在任何活动连接，持久化的在线标记全部失真：
-      // 玩家/观战者先置离线（凭 token 重连即恢复）；不回来的观战者走宽限清理，
-      // 避免他们仍被计入在线人数、让新观战者撞上"观战人数已满"或残留在大厅名单。
+      // 重启后不存在任何活动连接。玩家保留座位、置离线，凭 token 重连恢复；
+      // 观战者是临时只读身份，立即清出——不能让他们在大厅/对局名单里挂到延迟清理才消失，
+      // 也不能虚占在线名额让新观战者撞上"已满"。想继续看的人重新输入房间码即可。
       game.resetConnectionsAfterRestart(room);
+      game.removeAllSpectators(room);
       rooms.set(room.code, room);
-      for (const s of room.spectators) scheduleSpectatorPrune(s.id);
+      loadedRoomCodes.add(room.code);
       // 重启后回合计时重新挂上
       if (room.phase === 'playing' && room.turn) {
         if (room.turn.deadline) {
@@ -45,7 +47,11 @@ function loadRooms() {
         scheduleTurnTimer(room);
       }
     }
-    for (const [token, ref] of Object.entries(raw.tokens)) tokens.set(token, ref);
+    // 只恢复玩家 token；旧观战身份已随重启作废，其 token 一并丢弃，避免残留膨胀
+    for (const [token, ref] of Object.entries(raw.tokens || {})) {
+      if (ref && !ref.spectator && loadedRoomCodes.has(ref.roomCode)) tokens.set(token, ref);
+    }
+    if (raw.rooms.length) saveRooms(); // 落盘已清出观战者的干净状态
     console.log(`已恢复 ${rooms.size} 个房间`);
   } catch { /* 首次启动或数据损坏，忽略 */ }
 }
